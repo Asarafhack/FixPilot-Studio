@@ -1,0 +1,36 @@
+{
+  "name": "fixpilot-studio",
+  "displayName": "FixPilot Studio",
+  "description": "Connect VS Code to the local FixPilot project-aware repair assistant.",
+  "version": "0.7.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:fixpilot.analyzeSelection",
+    "onCommand:fixpilot.analyzeTerminal"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "fixpilot.analyzeSelection",
+        "title": "FixPilot: Analyze Selected Error"
+      },
+      {
+        "command": "fixpilot.analyzeTerminal",
+        "title": "FixPilot: Analyze Terminal Error"
+      }
+    ],
+    "configuration": {
+      "properties": {
+        "fixpilot.bridgeUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Local FixPilot bridge URL."
+        }
+      }
+    }
+  }
+}
