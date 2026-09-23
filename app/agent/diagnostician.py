@@ -1,5 +1,6 @@
 from app.rag import retrieve
 from app.repair.planner import build_error_repair_plan
+from app.agent.error_fingerprint import fingerprint_error
 
 
 PATTERNS = [
@@ -53,7 +54,17 @@ def _classify(error):
 
 
 def diagnose_error(error):
+    """
+    Diagnose a developer error and enrich the existing diagnosis
+    with a structured error fingerprint.
+
+    The fingerprint is additive and does not replace the existing
+    category classification used by RAG or the repair planner.
+    """
+
     category_code, label, cause, recommendation = _classify(error)
+
+    fingerprint = fingerprint_error(error)
 
     return {
         # Public human-readable category used by the UI and existing API.
@@ -66,6 +77,9 @@ def diagnose_error(error):
         "confidence": "High" if category_code != "unknown" else "Low",
         "sources": retrieve(error, category_code),
         "recommendation": recommendation,
+
+        # Structured error fingerprint for deeper reasoning.
+        "fingerprint": fingerprint,
 
         # Planner receives the internal category code.
         "repair_plan": build_error_repair_plan(category_code, error),
