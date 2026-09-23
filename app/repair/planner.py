@@ -1,19 +1,16 @@
 import re
 
+from app.agent.conflict_reasoner import analyze_dependency_conflict
+from app.agent.root_cause import analyze_root_cause
+
 
 def _extract_python_package(error):
-    """
-    Extract the top-level Python import/package name from a
-    ModuleNotFoundError message.
-    """
-
-    if not error:
-        return None
+    """Extract the top-level Python package from a ModuleNotFoundError."""
 
     match = re.search(
-        r"No module named\s+['\"]?([A-Za-z0-9_.-]+)['\"]?",
+        r"No module named ['\"]?([A-Za-z0-9_.-]+)['\"]?",
         error,
-        re.I,
+        re.IGNORECASE,
     )
 
     if not match:
@@ -23,340 +20,456 @@ def _extract_python_package(error):
 
 
 def _extract_node_package(error):
-    """
-    Extract a Node.js package name from common module errors.
-    """
+    """Extract a Node.js package from MODULE_NOT_FOUND errors."""
 
-    if not error:
+    match = re.search(
+        r"(?:Cannot find module|Cannot find package)\s+['\"]([^'\"]+)['\"]",
+        error,
+        re.IGNORECASE,
+    )
+
+    if not match:
         return None
 
+    package = match.group(1)
+
+    # Ignore local paths.
+    if (
+        package.startswith(".")
+        or package.startswith("/")
+        or "\\" in package
+    ):
+        return None
+
+    # Preserve scoped packages such as @scope/package.
+    if package.startswith("@"):
+        parts = package.split("/")
+
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+
+    return package.split("/")[0]
+
+
+def _extract_port(error):
+    """
+    Extract a TCP port from common EADDRINUSE errors.
+
+    Examples:
+        EADDRINUSE: address already in use :::3000
+        listen EADDRINUSE: address already in use 127.0.0.1:8000
+        EADDRINUSE port 3000
+    """
+
     patterns = [
-        r"Cannot find module\s+['\"]([^'\"]+)['\"]",
-        r"Cannot find package\s+['\"]([^'\"]+)['\"]",
+        r"address already in use\s+.*?:(\d+)",
+        r"EADDRINUSE.*?:(\d+)",
+        r"\bport\s+(\d+)\b",
     ]
 
     for pattern in patterns:
         match = re.search(
             pattern,
             error,
-            re.I,
+            re.IGNORECASE,
         )
 
-        if not match:
-            continue
-
-        package = match.group(1).strip()
-
-        # Local files are not npm packages.
-        if package.startswith("."):
-            return None
-
-        if package.startswith("/"):
-            return None
-
-        if package.startswith("@"):
-            parts = package.split("/")
-
-            if len(parts) >= 2:
-                return "/".join(parts[:2])
-
-        return package
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                pass
 
     return None
 
 
 def build_error_repair_plan(category, error):
     """
-    Build a basic repair plan from a diagnosed error.
+    Original category-based repair planner.
 
-    This is the original V1.0-compatible planner API.
-
-    Safety validation and actual command execution must happen
-    downstream in the repair executor/validator.
+    This function only creates a repair plan.
+    It never executes the repair.
     """
+
+    plans = []
 
     if category == "python_missing_module":
         package = _extract_python_package(error)
 
-        if not package:
-            return []
-
-        return [
-            {
-                "id": "python_missing_module",
-                "title": f"Install Python package: {package}",
-                "reason": (
-                    "The active Python environment cannot import "
-                    "the reported module."
-                ),
-                "action": "pip_install",
-                "package": package,
-                "preview": (
-                    f"{package} will be installed with the active "
-                    "Python interpreter."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    if category == "node_missing_module":
-        package = _extract_node_package(error)
-
-        if not package:
-            return []
-
-        return [
-            {
-                "id": "node_missing_module",
-                "title": f"Install Node package: {package}",
-                "reason": (
-                    "The Node.js project cannot resolve the "
-                    "reported module."
-                ),
-                "action": "npm_install",
-                "package": package,
-                "preview": (
-                    f"{package} will be installed using the "
-                    "project package manager."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    if category == "port_in_use":
-        match = re.search(
-            r"(?:port|:)\s*(\d{2,5})",
-            error,
-            re.I,
-        )
-
-        if not match:
-            return []
-
-        port = int(match.group(1))
-
-        if port < 1 or port > 65535:
-            return []
-
-        return [
-            {
-                "id": "port_in_use",
-                "title": f"Inspect process using port {port}",
-                "reason": (
-                    f"Another process is already using port {port}."
-                ),
-                "action": "inspect_port",
-                "port": port,
-                "preview": (
-                    f"Identify the process currently listening "
-                    f"on port {port} before taking further action."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    if category == "command_not_found":
-        match = re.search(
-            r"(?:'([^']+)'|\"([^\"]+)\"|^|\s)"
-            r"([A-Za-z0-9_.-]+)"
-            r"(?:\s+is not recognized|\s+not found)",
-            error,
-            re.I,
-        )
-
-        command = None
-
-        if match:
-            command = (
-                match.group(1)
-                or match.group(2)
-                or match.group(3)
+        if package:
+            plans.append(
+                {
+                    "action": "pip_install",
+                    "package": package,
+                    "risk": "LOW",
+                    "reason": (
+                        f"Python dependency '{package}' "
+                        "appears to be missing."
+                    ),
+                }
             )
 
-        if not command:
-            return []
+    elif category == "node_missing_module":
+        package = _extract_node_package(error)
 
-        return [
+        if package:
+            plans.append(
+                {
+                    "action": "npm_install",
+                    "package": package,
+                    "risk": "LOW",
+                    "reason": (
+                        f"Node dependency '{package}' "
+                        "appears to be missing."
+                    ),
+                }
+            )
+
+    elif category == "port_in_use":
+        port = _extract_port(error)
+
+        plan = {
+            "action": "inspect_port",
+            "risk": "LOW",
+            "reason": (
+                "Another process may already be using "
+                "the requested port."
+            ),
+        }
+
+        if port is not None:
+            plan["port"] = port
+
+        plans.append(plan)
+
+    elif category == "command_not_found":
+        plans.append(
             {
-                "id": "command_not_found",
-                "title": f"Inspect command: {command}",
-                "reason": (
-                    f"The command '{command}' is not available "
-                    "in the current environment."
-                ),
                 "action": "inspect_path",
-                "command": command,
-                "preview": (
-                    f"Check whether '{command}' is installed "
-                    "and available through PATH."
-                ),
                 "risk": "LOW",
+                "reason": (
+                    "The requested command could not be "
+                    "resolved from PATH."
+                ),
             }
-        ]
+        )
 
-    return []
+    return plans
+
+
+def _dependency_from_conflict(conflict):
+    """Convert conflict analysis into root-cause dependency input."""
+
+    if not conflict:
+        return None
+
+    installed = conflict.get("installed", False)
+    declared = conflict.get("declared", False)
+
+    if isinstance(installed, dict):
+        installed = installed.get("installed", False)
+
+    return {
+        "installed": bool(installed),
+        "declared": bool(declared),
+        "installed_version": conflict.get("installed_version"),
+        "declaration": conflict.get("declaration"),
+    }
+
+
+def _build_reasoned_plan_from_root_cause(
+    root_cause,
+    package,
+):
+    """
+    Convert root-cause analysis into a structured repair plan.
+
+    No command is executed here.
+    """
+
+    cause_code = root_cause.get("cause_code")
+    confidence = root_cause.get("confidence", 0.0)
+    evidence = root_cause.get("evidence", [])
+    dependency_state = root_cause.get("dependency_state")
+    reason = root_cause.get("root_cause")
+
+    # ---------------------------------------------------------
+    # Package installed but not declared
+    # ---------------------------------------------------------
+
+    if cause_code == "dependency_not_declared":
+        return {
+            "action": "declare_dependency",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Package declared but not installed
+    # ---------------------------------------------------------
+
+    if cause_code == "dependency_not_installed":
+        return {
+            "action": "pip_install",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Package missing and undeclared
+    # ---------------------------------------------------------
+
+    if cause_code == "missing_dependency":
+        return {
+            "action": "declare_dependency",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Package installed + declared but import failed
+    #
+    # Existing V1.1 behavior expects verify_import.
+    # ---------------------------------------------------------
+
+    if cause_code == "environment_mismatch":
+        return {
+            "action": "verify_import",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Python dependency state unknown
+    # ---------------------------------------------------------
+
+    if cause_code == "python_dependency_unknown":
+        return {
+            "action": "verify_environment",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Node package installed but not declared
+    # ---------------------------------------------------------
+
+    if cause_code == "node_dependency_not_declared":
+        return {
+            "action": "npm_install",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Node package declared but not installed
+    # ---------------------------------------------------------
+
+    if cause_code == "node_dependency_not_installed":
+        return {
+            "action": "npm_install",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Node package missing
+    # ---------------------------------------------------------
+
+    if cause_code == "node_missing_dependency":
+        return {
+            "action": "npm_install",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    # ---------------------------------------------------------
+    # Node environment mismatch
+    # ---------------------------------------------------------
+
+    if cause_code == "node_environment_mismatch":
+        return {
+            "action": "verify_environment",
+            "package": package,
+            "risk": "LOW",
+            "reason": reason,
+            "cause_code": cause_code,
+            "confidence": confidence,
+            "evidence": evidence,
+            "dependency_state": dependency_state,
+        }
+
+    return None
 
 
 def build_reasoned_repair_plan(error, project_root="."):
     """
-    Build a repair plan using project-aware dependency reasoning.
+    Build a project-aware repair plan.
 
-    The reasoning layer decides whether the dependency should be:
-    - verified
-    - declared
-    - installed
-    - handled as an environment issue
+    Flow:
 
-    The actual repair executor remains responsible for
-    safety validation and command execution.
+        Error
+          ↓
+        Diagnosis
+          ↓
+        Dependency conflict
+          ↓
+        Root-cause analysis
+          ↓
+        Structured repair plan
+
+    This function does not execute repairs.
     """
 
+    # Local import is intentional.
+    #
+    # diagnostician.py imports build_error_repair_plan
+    # from this module. Keeping this import local prevents
+    # the planner <-> diagnostician circular import.
     from app.agent.diagnostician import diagnose_error
-    from app.agent.conflict_reasoner import analyze_dependency_conflict
 
     diagnosis = diagnose_error(error)
 
-    category_code = diagnosis["category_code"]
+    category_code = diagnosis.get("category_code")
+    fingerprint = diagnosis.get("fingerprint") or {}
 
-    if category_code != "python_missing_module":
+    language = fingerprint.get("language")
+    error_type = fingerprint.get("error_type")
+
+    # ---------------------------------------------------------
+    # Python ModuleNotFoundError
+    # ---------------------------------------------------------
+
+    if (
+        language == "python"
+        and error_type == "ModuleNotFoundError"
+    ):
+        module = (
+            fingerprint.get("module")
+            or fingerprint.get("package")
+            or _extract_python_package(error)
+        )
+
+        if module:
+            conflict = analyze_dependency_conflict(
+                module,
+                project_root,
+            )
+
+            dependency = _dependency_from_conflict(
+                conflict
+            )
+
+            root_cause = analyze_root_cause(
+                fingerprint,
+                dependency=dependency,
+                environment=conflict.get("environment"),
+                conflict=conflict,
+            )
+
+            package = (
+                root_cause.get("package")
+                or conflict.get("package")
+                or module
+            )
+
+            plan = _build_reasoned_plan_from_root_cause(
+                root_cause,
+                package,
+            )
+
+            if plan:
+                return [plan]
+
+            return build_error_repair_plan(
+                category_code,
+                error,
+            )
+
+    # ---------------------------------------------------------
+    # Node MODULE_NOT_FOUND
+    # ---------------------------------------------------------
+
+    if (
+        language == "node"
+        and error_type == "MODULE_NOT_FOUND"
+    ):
+        package = (
+            fingerprint.get("package")
+            or fingerprint.get("module")
+            or _extract_node_package(error)
+        )
+
+        if package:
+            return build_error_repair_plan(
+                category_code,
+                error,
+            )
+
+    # ---------------------------------------------------------
+    # Port conflict
+    # ---------------------------------------------------------
+
+    if error_type == "EADDRINUSE":
         return build_error_repair_plan(
             category_code,
             error,
         )
 
-    module = _extract_python_package(error)
+    # ---------------------------------------------------------
+    # Command not found
+    # ---------------------------------------------------------
 
-    if not module:
+    if category_code == "command_not_found":
         return build_error_repair_plan(
             category_code,
             error,
         )
 
-    conflict = analyze_dependency_conflict(
-        module,
-        project_root,
-    )
+    # ---------------------------------------------------------
+    # Final fallback
+    # ---------------------------------------------------------
 
-    status = conflict["status"]
-    package = conflict["package"]
-
-    # ---------------------------------------------------------
-    # Package is installed and declared.
-    # ---------------------------------------------------------
-    if status == "healthy":
-        return [
-            {
-                "id": "verify_import",
-                "title": f"Verify Python import: {module}",
-                "reason": (
-                    f"{package} is installed and declared "
-                    "by the project."
-                ),
-                "action": "verify_import",
-                "package": package,
-                "preview": (
-                    f"Verify that {module} imports successfully "
-                    "with the active Python interpreter."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    # ---------------------------------------------------------
-    # Package is installed globally/environment-wise but the
-    # project does not declare it.
-    # ---------------------------------------------------------
-    if status == "installed_not_declared":
-        return [
-            {
-                "id": "declare_dependency",
-                "title": f"Declare Python dependency: {package}",
-                "reason": (
-                    f"{package} is installed in the active "
-                    "environment but is not declared by "
-                    "the project."
-                ),
-                "action": "declare_dependency",
-                "package": package,
-                "preview": (
-                    f"Add {package} to the project's dependency "
-                    "configuration."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    # ---------------------------------------------------------
-    # Package is declared but missing from the active environment.
-    # ---------------------------------------------------------
-    if status == "declared_not_installed":
-        return [
-            {
-                "id": "python_missing_module",
-                "title": f"Install Python package: {package}",
-                "reason": (
-                    f"{package} is declared by the project "
-                    "but is not installed in the active "
-                    "environment."
-                ),
-                "action": "pip_install",
-                "package": package,
-                "preview": (
-                    f"{package} will be installed with the "
-                    "active Python interpreter."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    # ---------------------------------------------------------
-    # Package is neither installed nor declared.
-    #
-    # We intentionally DO NOT install automatically.
-    # The reasoned plan asks to declare it first.
-    # ---------------------------------------------------------
-    if status == "missing_and_undeclared":
-        return [
-            {
-                "id": "declare_dependency",
-                "title": f"Declare Python dependency: {package}",
-                "reason": (
-                    f"{package} is neither installed nor declared "
-                    "by the project."
-                ),
-                "action": "declare_dependency",
-                "package": package,
-                "preview": (
-                    f"Add {package} to the project's dependency "
-                    "configuration before installation."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    # ---------------------------------------------------------
-    # Python itself is unavailable.
-    # ---------------------------------------------------------
-    if status == "python_unavailable":
-        return [
-            {
-                "id": "verify_environment",
-                "title": "Verify Python environment",
-                "reason": (
-                    "FixPilot could not find a usable "
-                    "Python interpreter."
-                ),
-                "action": "verify_environment",
-                "package": package,
-                "preview": (
-                    "Verify the configured Python interpreter "
-                    "and virtual environment."
-                ),
-                "risk": "LOW",
-            }
-        ]
-
-    # Unknown state: fall back to the original planner.
     return build_error_repair_plan(
         category_code,
         error,
