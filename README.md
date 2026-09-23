@@ -81,6 +81,8 @@ build\build_windows.bat
 ```
 
 Output:
+<img width="1920" height="1022" alt="{9A5F31BC-ABC4-4D3C-A7D3-3E2675483CF0}" src="https://github.com/user-attachments/assets/894e96af-06d1-437f-a571-e637daa8bedb" />
+
 
 ```text
 dist\FixPilot-Studio\
