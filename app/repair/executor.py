@@ -4,6 +4,7 @@ import sys
 import time
 from pathlib import Path
 
+from app.context.interpreter import find_project_interpreter
 from app.repair.storage import logs_dir
 from app.repair.validator import validate_repair_plan
 
@@ -171,9 +172,34 @@ def execute_plan(plan, cwd=None):
     if action == "pip_install":
         package = plan["package"]
 
+        project_interpreter = find_project_interpreter(
+            cwd or Path.cwd()
+        )
+
+        if not project_interpreter:
+            _audit(
+                "repair_failed",
+                {
+                    "action": action,
+                    "package": package,
+                    "reason": "python_interpreter_not_found",
+                },
+            )
+
+            return {
+                "success": False,
+                "blocked": False,
+                "action": action,
+                "package": package,
+                "message": (
+                    "Could not determine a Python interpreter "
+                    "for the target project."
+                ),
+            }
+
         ok, output = _run(
             [
-                sys.executable,
+                project_interpreter,
                 "-m",
                 "pip",
                 "install",
@@ -187,8 +213,10 @@ def execute_plan(plan, cwd=None):
             "blocked": False,
             "action": action,
             "package": package,
+            "interpreter": project_interpreter,
             "message": (
-                f"$ {sys.executable} -m pip install {package}\n"
+                f"$ {project_interpreter} -m pip install "
+                f"{package}\n"
                 f"{output}"
             ),
         }

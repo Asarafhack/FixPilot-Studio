@@ -1,3 +1,4 @@
+import sys
 from app.repair.verifier import (
     verify_environment,
     verify_node_module,

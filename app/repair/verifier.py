@@ -1,16 +1,13 @@
 import importlib.util
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+from app.context.interpreter import find_project_interpreter
 
 
 def _run_original_command(command, cwd=None):
-    """
-    Re-run the original failing command.
-
-    This preserves the existing V0.9 verification behavior.
-    """
-
     if not command:
         return None
 
@@ -41,7 +38,12 @@ def _run_original_command(command, cwd=None):
 
 def verify_python_import(module_name):
     """
-    Verify that a Python module can be discovered/imported.
+    Verify that a Python module can be discovered by the
+    current FixPilot Python interpreter.
+
+    This is a lightweight inspection check.
+    For project-aware verification, use
+    verify_python_import_runtime().
     """
 
     if not isinstance(module_name, str) or not module_name.strip():
@@ -72,9 +74,14 @@ def verify_python_import(module_name):
                 "is available."
             ),
             "module": module_name,
+            "interpreter": sys.executable,
         }
 
-    except (ImportError, ModuleNotFoundError, ValueError) as exc:
+    except (
+        ImportError,
+        ModuleNotFoundError,
+        ValueError,
+    ) as exc:
         return {
             "success": False,
             "message": (
@@ -85,13 +92,27 @@ def verify_python_import(module_name):
         }
 
 
-def verify_python_import_runtime(module_name):
+def verify_python_import_runtime(
+    module_name,
+    project_root=None,
+):
     """
-    Actually execute a Python import in a separate process.
+    Actually import a Python module using the interpreter
+    belonging to the target project.
 
-    find_spec() can confirm that a module exists, but a real
-    import catches cases where the package exists but cannot
-    actually load.
+    If the project contains:
+
+        .venv\\Scripts\\python.exe
+
+    or:
+
+        venv\\Scripts\\python.exe
+
+    that interpreter is preferred.
+
+    This prevents FixPilot from accidentally validating a
+    globally installed package when the application itself
+    runs inside a project virtual environment.
     """
 
     if not isinstance(module_name, str) or not module_name.strip():
@@ -102,10 +123,32 @@ def verify_python_import_runtime(module_name):
 
     module_name = module_name.strip()
 
+    project_path = (
+        Path(project_root).resolve()
+        if project_root
+        else Path.cwd().resolve()
+    )
+
+    interpreter = find_project_interpreter(
+        project_path
+    )
+
+    if not interpreter:
+        return {
+            "success": False,
+            "message": (
+                "Could not determine the Python interpreter "
+                "for the target project."
+            ),
+            "module": module_name,
+            "interpreter": None,
+            "project_root": str(project_path),
+        }
+
     try:
         result = subprocess.run(
             [
-                "python",
+                interpreter,
                 "-c",
                 f"import {module_name}",
             ],
@@ -113,6 +156,7 @@ def verify_python_import_runtime(module_name):
             text=True,
             timeout=30,
             shell=False,
+            cwd=str(project_path),
         )
 
         output = (
@@ -124,20 +168,48 @@ def verify_python_import_runtime(module_name):
             return {
                 "success": True,
                 "message": (
-                    f"Python import verification passed "
-                    f"for '{module_name}'."
+                    f"Python runtime import verification "
+                    f"passed for '{module_name}'."
                 ),
                 "module": module_name,
+                "interpreter": interpreter,
+                "project_root": str(project_path),
             }
 
         return {
             "success": False,
             "message": (
-                f"Python import verification failed "
-                f"for '{module_name}'."
+                f"Python runtime import verification "
+                f"failed for '{module_name}'."
             ),
             "module": module_name,
+            "interpreter": interpreter,
+            "project_root": str(project_path),
             "output": output[-3000:],
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "message": (
+                f"Python runtime import verification "
+                f"timed out for '{module_name}'."
+            ),
+            "module": module_name,
+            "interpreter": interpreter,
+            "project_root": str(project_path),
+        }
+
+    except OSError as exc:
+        return {
+            "success": False,
+            "message": (
+                f"Could not execute project Python "
+                f"interpreter: {exc}"
+            ),
+            "module": module_name,
+            "interpreter": interpreter,
+            "project_root": str(project_path),
         }
 
     except Exception as exc:
@@ -147,12 +219,15 @@ def verify_python_import_runtime(module_name):
                 f"Python runtime verification failed: {exc}"
             ),
             "module": module_name,
+            "interpreter": interpreter,
+            "project_root": str(project_path),
         }
 
 
 def verify_node_module(package_name, cwd=None):
     """
-    Verify that a Node package can be resolved from the project.
+    Verify that a Node package can be resolved from
+    the target project.
     """
 
     if not isinstance(package_name, str) or not package_name.strip():
@@ -175,11 +250,7 @@ def verify_node_module(package_name, cwd=None):
             [
                 "node",
                 "-e",
-                (
-                    "require.resolve("
-                    f"{package_name!r}"
-                    ")"
-                ),
+                f"require.resolve({package_name!r})",
             ],
             capture_output=True,
             text=True,
@@ -213,6 +284,25 @@ def verify_node_module(package_name, cwd=None):
             "output": output[-3000:],
         }
 
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "message": (
+                f"Node module verification timed out "
+                f"for '{package_name}'."
+            ),
+            "package": package_name,
+        }
+
+    except OSError as exc:
+        return {
+            "success": False,
+            "message": (
+                f"Node module verification failed: {exc}"
+            ),
+            "package": package_name,
+        }
+
     except Exception as exc:
         return {
             "success": False,
@@ -223,12 +313,17 @@ def verify_node_module(package_name, cwd=None):
         }
 
 
-def verify_environment():
+def verify_environment(project_root=None):
     """
-    Verify that the basic Python and Node runtimes are available.
+    Verify the development runtimes available to FixPilot
+    and identify the interpreter used by the target project.
     """
 
-    python_available = shutil.which("python") is not None
+    project_interpreter = find_project_interpreter(
+        project_root or Path.cwd()
+    )
+
+    python_available = bool(project_interpreter)
     node_available = shutil.which("node") is not None
 
     checks = {
@@ -236,17 +331,16 @@ def verify_environment():
         "node": node_available,
     }
 
-    if python_available or node_available:
-        return {
-            "success": True,
-            "message": "Development environment is partially available.",
-            "checks": checks,
-        }
-
     return {
-        "success": False,
-        "message": "Python and Node.js were not found on PATH.",
+        "success": python_available or node_available,
+        "message": (
+            "Development environment is partially available."
+            if python_available or node_available
+            else "Python and Node.js are unavailable."
+        ),
         "checks": checks,
+        "python_executable": project_interpreter,
+        "fixpilot_python_executable": sys.executable,
     }
 
 
@@ -259,8 +353,8 @@ def verify_plan(
     """
     Verify a completed repair plan.
 
-    This keeps the original V0.9 API while adding
-    V1.3 structured verification.
+    Python verification is performed using the target
+    project's interpreter, not FixPilot's own interpreter.
     """
 
     if not plan:
@@ -278,7 +372,11 @@ def verify_plan(
         if action == "pip_install":
             package = item.get("package", "")
 
-            verification = verify_python_import(package)
+            verification = verify_python_import_runtime(
+                package,
+                project_root=cwd,
+            )
+
             verification_results.append(verification)
 
             if not verification["success"]:
@@ -304,7 +402,11 @@ def verify_plan(
         elif action == "verify_import":
             package = item.get("package", "")
 
-            verification = verify_python_import(package)
+            verification = verify_python_import_runtime(
+                package,
+                project_root=cwd,
+            )
+
             verification_results.append(verification)
 
             if not verification["success"]:
@@ -313,13 +415,29 @@ def verify_plan(
                 )
 
         elif action == "verify_environment":
-            verification = verify_environment()
+            verification = verify_environment(
+                project_root=cwd,
+            )
+
             verification_results.append(verification)
 
             if not verification["success"]:
                 unresolved.append(
                     verification["message"]
                 )
+
+        elif action == "declare_dependency":
+            verification_results.append(
+                {
+                    "success": True,
+                    "message": (
+                        "Dependency declaration guidance "
+                        "was processed."
+                    ),
+                    "action": action,
+                    "package": item.get("package", ""),
+                }
+            )
 
         elif action in {
             "show_port_guidance",
@@ -339,10 +457,6 @@ def verify_plan(
                 "no PATH modification was made."
             )
 
-    # ---------------------------------------------------------
-    # Re-run original command when supplied.
-    # ---------------------------------------------------------
-
     command_result = _run_original_command(
         original_command,
         cwd,
@@ -353,10 +467,6 @@ def verify_plan(
             "Original command still exits with "
             f"code {command_result['returncode']}."
         )
-
-    # ---------------------------------------------------------
-    # Final result.
-    # ---------------------------------------------------------
 
     if unresolved:
         return {

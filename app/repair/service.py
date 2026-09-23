@@ -1,21 +1,59 @@
+from app.repair.approval import (
+    approve_repair,
+    create_approval_request,
+)
 from app.repair.executor import execute_plan
 from app.repair.verifier import verify_plan
+
+
+def _is_verification_action(action):
+    return action in {
+        "verify_import",
+        "verify_environment",
+        "inspect_port",
+        "inspect_path",
+    }
+
+
+def _is_noop_install(package, cwd=None):
+    """
+    Return True when a Python package is already importable.
+    """
+
+    if not package:
+        return False
+
+    from app.repair.verifier import verify_python_import
+
+    result = verify_python_import(package)
+
+    return result.get("success") is True
 
 
 def repair_and_verify(
     plan,
     cwd=None,
     original_command=None,
+    approved=False,
 ):
     """
-    Execute a structured repair plan and automatically verify it.
+    Execute and verify a structured repair plan.
 
-    Execution actions perform changes.
+    Modification actions require explicit approval.
 
-    Verification actions perform checks.
+    Read-only verification actions do not require approval.
 
-    A failed verification must be reported as a
-    verification failure, not an execution failure.
+    Flow:
+
+        Plan
+          ↓
+        Safety Validator
+          ↓
+        Approval Gate
+          ↓
+        Executor
+          ↓
+        Verification
     """
 
     if not plan:
@@ -27,19 +65,70 @@ def repair_and_verify(
 
     execution_results = []
 
-    verification_actions = {
-        "verify_import",
-        "verify_environment",
-        "inspect_port",
-        "inspect_path",
-    }
-
-    # ---------------------------------------------------------
-    # Execute each plan item.
-    # ---------------------------------------------------------
-
     for item in plan:
         action = item.get("action")
+
+        # -----------------------------------------------------
+        # Approval gate
+        # -----------------------------------------------------
+
+        approval_request = create_approval_request(item)
+
+        if approval_request.get("required"):
+
+            if not approved:
+                return {
+                    "success": False,
+                    "stage": "approval_required",
+                    "message": approval_request["message"],
+                    "approval_request": approval_request,
+                    "execution_results": execution_results,
+                    "verification": None,
+                }
+
+            approval = approve_repair(
+                approval_request
+            )
+
+            if not approval.get("approved"):
+                return {
+                    "success": False,
+                    "stage": "approval_denied",
+                    "message": "Repair was not approved.",
+                    "approval_request": approval_request,
+                    "execution_results": execution_results,
+                    "verification": None,
+                }
+
+        # -----------------------------------------------------
+        # Skip unnecessary Python installation.
+        # -----------------------------------------------------
+
+        if action == "pip_install":
+            package = item.get("package")
+
+            if _is_noop_install(
+                package,
+                cwd=cwd,
+            ):
+                execution = {
+                    "success": True,
+                    "blocked": False,
+                    "action": action,
+                    "package": package,
+                    "skipped": True,
+                    "message": (
+                        f"Package '{package}' is already "
+                        "available. Installation skipped."
+                    ),
+                }
+
+                execution_results.append(execution)
+                continue
+
+        # -----------------------------------------------------
+        # Execute
+        # -----------------------------------------------------
 
         execution = execute_plan(
             item,
@@ -48,15 +137,9 @@ def repair_and_verify(
 
         execution_results.append(execution)
 
-        # A verification action can legitimately return
-        # success=False because the condition being checked
-        # was not satisfied.
-        #
-        # It must therefore continue to the verification
-        # stage instead of being classified as an executor
-        # failure.
         if not execution.get("success"):
-            if action in verification_actions:
+
+            if _is_verification_action(action):
                 continue
 
             return {
@@ -92,10 +175,6 @@ def repair_and_verify(
             "execution_results": execution_results,
             "verification": verification,
         }
-
-    # ---------------------------------------------------------
-    # Completed successfully.
-    # ---------------------------------------------------------
 
     return {
         "success": True,
